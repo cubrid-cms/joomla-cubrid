@@ -10,12 +10,12 @@
 defined('JPATH_PLATFORM') or die;
 
 /**
- * CUBRID database driver
+ * Cubrid database driver
  *
- * @link   https://secure.php.net/pdo
+ * @link   https://secure.php.net/manual/en/book.cubrid.php
  * @since  12.1
  */
-class JDatabaseDriverCubrid extends JDatabaseDriverPdo
+class JDatabaseDriverCubrid extends JDatabaseDriver
 {
 	/**
 	 * The name of the database driver.
@@ -34,15 +34,56 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	public $serverType = 'cubrid';
 
 	/**
+	 * @var    Cubrid  The database connection resource.
+	 * @since  11.1
+	 */
+	protected $connection;
+
+	/**
 	 * The character(s) used to quote SQL statement names such as table names or field names,
 	 * etc. The child classes should define this as necessary.  If a single character string the
 	 * same character is used for both sides of the quoted name, else the first character will be
 	 * used for the opening quote and the second for the closing quote.
 	 *
 	 * @var    string
-	 * @since  12.1
+	 * @since  12.2
 	 */
 	protected $nameQuote = '`';
+
+	/**
+	 * The null or zero representation of a timestamp for the database driver.  This should be
+	 * defined in child classes to hold the appropriate value for the engine.
+	 *
+	 * @var    string
+	 * @since  12.2
+	 */
+	protected $nullDate = '0000-00-00 00:00:00';
+
+	/**
+	 * @var    string  The minimum supported database version.
+	 * @since  12.2
+	 */
+	protected static $dbMinimum = '9.3.0';
+
+	/**
+	 * Constructor.
+	 *
+	 * @param   array  $options  List of options used to configure the connection
+	 *
+	 * @since   12.1
+	 */
+	public function __construct($options)
+	{
+		// Get some basic values from the options.
+		$options['host']     = (isset($options['host'])) ? $options['host'] : 'localhost';
+		$options['user']     = (isset($options['user'])) ? $options['user'] : '';
+		$options['password'] = (isset($options['password'])) ? $options['password'] : '';
+		$options['database'] = (isset($options['database'])) ? $options['database'] : '';
+		$options['port']     = (isset($options['port'])) ? (int) $options['port'] : null;
+
+		// Finalize initialisation.
+		parent::__construct($options);
+	}
 
 	/**
 	 * Connects to the database if needed.
@@ -53,46 +94,78 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 * @throws  RuntimeException
 	 */
 	public function connect()
-	{
+	{		
 		if ($this->connection)
 		{
 			return;
 		}
 
-		parent::connect();
+		/*
+		 * Unlike cubrid_connect() takes the port and socket as separate arguments. Therefore, we
+		 * have to extract them from the host string.
+		 */
+		$port = isset($this->options['port']) ? $this->options['port'] : 55302;
+		$regex = '/^(?P<host>((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))(:(?P<port>.+))?$/';
 
-		$this->connection->cubridCreateFunction(
-			'ROW_NUMBER',
-			function($init = null)
+		if (preg_match($regex, $this->options['host'], $matches))
+		{
+			// It's an IPv4 address with or without port
+			$this->options['host'] = $matches['host'];
+
+			if (!empty($matches['port']))
 			{
-				static $rownum, $partition;
-
-				if ($init !== null)
-				{
-					$rownum = $init;
-					$partition = null;
-
-					return $rownum;
-				}
-
-				$args = func_get_args();
-				array_shift($args);
-
-				$partitionBy = $args ? implode(',', $args) : null;
-
-				if ($partitionBy === null || $partitionBy === $partition)
-				{
-					$rownum++;
-				}
-				else
-				{
-					$rownum    = 1;
-					$partition = $partitionBy;
-				}
-
-				return $rownum;
+				$port = $matches['port'];
 			}
+		}
+		elseif (preg_match('/^(?P<host>\[.*\])(:(?P<port>.+))?$/', $this->options['host'], $matches))
+		{
+			// We assume square-bracketed IPv6 address with or without port, e.g. [fe80:102::2%eth1]:3306
+			$this->options['host'] = $matches['host'];
+
+			if (!empty($matches['port']))
+			{
+				$port = $matches['port'];
+			}
+		}
+		elseif (preg_match('/^(?P<host>(\w+:\/{2,3})?[a-z0-9\.\-]+)(:(?P<port>[^:]+))?$/i', $this->options['host'], $matches))
+		{
+			// Named host (e.g example.com or localhost) with or without port
+			$this->options['host'] = $matches['host'];
+
+			if (!empty($matches['port']))
+			{
+				$port = $matches['port'];
+			}
+		}
+		elseif (preg_match('/^:(?P<port>[^:]+)$/', $this->options['host'], $matches))
+		{
+			// Empty host, just port, e.g. ':3306'
+			$this->options['host'] = 'localhost';
+			$port = $matches['port'];
+		}
+		// ... else we assume normal (naked) IPv6 address, so host and port stay as they are or default
+
+		// Make sure the Cubrid extension for PHP is installed and enabled.
+		if (!self::isSupported())
+		{
+			throw new JDatabaseExceptionUnsupported('The Cubrid extension for PHP is not installed or enabled.');
+		}
+
+		$this->connection = @cubrid_connect(
+			$this->options['host'], $port, $this->options['database'], $this->options['user'], $this->options['password']
 		);
+
+		// Attempt to connect to the server.
+		if (!$this->connection)
+		{
+			throw new JDatabaseExceptionConnecting('Could not connect to Cubrid server.');
+		}
+
+		// Pre-populate the UTF-8 Multibyte compatibility flag based on server version
+		$this->utf8mb4 = $this->serverClaimsUtf8mb4Support();
+
+		// Set the character set (needed for cubrid?).
+		$this->utf = $this->setUtf();
 	}
 
 	/**
@@ -104,9 +177,64 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 */
 	public function disconnect()
 	{
-		$this->freeResult();
+		// Close the connection.
+		cubrid_close($this->connection);
+
 
 		$this->connection = null;
+	}
+
+	/**
+	 * Method to escape a string for usage in an SQL statement.
+	 *
+	 * @param   string   $text   The string to be escaped.
+	 * @param   boolean  $extra  Optional parameter to provide extra escaping.
+	 *
+	 * @return  string  The escaped string.
+	 *
+	 * @since   12.1
+	 */
+	public function escape($text, $extra = false)
+	{
+		$this->connect();
+
+		$result = cubrid_real_escape_string($text, $this->getConnection());
+
+		if ($extra)
+		{
+			$result = addcslashes($result, '%_');
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Test to see if the MySQL connector is available.
+	 *
+	 * @return  boolean  True on success, false otherwise.
+	 *
+	 * @since   12.1
+	 */
+	public static function isSupported()
+	{
+		return function_exists('cubrid_connect');
+	}
+
+	/**
+	 * Determines if the connection to the server is active.
+	 *
+	 * @return  boolean  True if connected to the database engine.
+	 *
+	 * @since   12.1
+	 */
+	public function connected()
+	{
+		if (is_object($this->connection))
+		{
+			return cubrid_ping($this->connection);
+		}
+
+		return false;
 	}
 
 	/**
@@ -115,12 +243,13 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 * @param   string   $tableName  The name of the database table to drop.
 	 * @param   boolean  $ifExists   Optionally specify that the table must exist before it is dropped.
 	 *
-	 * @return  JDatabaseDriverSqlite  Returns this object to support chaining.
+	 * @return  JDatabaseDriverCubrid  Returns this object to support chaining.
 	 *
-	 * @since   12.1
+	 * @since   12.2
+	 * @throws  RuntimeException
 	 */
 	public function dropTable($tableName, $ifExists = true)
-	{
+	{			
 		$this->connect();
 
 		$query = $this->getQuery(true);
@@ -133,44 +262,44 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	}
 
 	/**
-	 * Method to escape a string for usage in an SQLite statement.
+	 * Get the number of affected rows by the last INSERT, UPDATE, REPLACE or DELETE for the previous executed SQL statement.
 	 *
-	 * Note: Using query objects with bound variables is
-	 * preferable to the below.
-	 *
-	 * @param   string   $text   The string to be escaped.
-	 * @param   boolean  $extra  Unused optional parameter to provide extra escaping.
-	 *
-	 * @return  string  The escaped string.
+	 * @return  integer  The number of affected rows.
 	 *
 	 * @since   12.1
 	 */
-	public function escape($text, $extra = false)
+	public function getAffectedRows()
 	{
-		if (is_int($text))
-		{
-			return $text;
-		}
+		$this->connect();
 
-		if (is_float($text))
-		{
-			// Force the dot as a decimal point.
-			return str_replace(',', '.', $text);
-		}
-
-		return Cubrid::escapeString($text);
+		return cubrid_affected_rows($this->connection);
 	}
 
 	/**
-	 * Method to get the database collation in use by sampling a text field of a table in the database.
+	 * Method to get the database collation.
 	 *
-	 * @return  mixed  The collation in use by the database or boolean false if not supported.
+	 * @return  mixed  The collation in use by the database (string) or boolean false if not supported.
 	 *
-	 * @since   12.1
+	 * @since   12.2
+	 * @throws  RuntimeException
 	 */
 	public function getCollation()
 	{
-		return $this->charset;
+		$this->connect();
+
+		// Attempt to get the database collation by accessing the server system variable.
+		$this->setQuery('SEELCT COLLATION(\'\') INTO Val');
+		$this->setQuery('SEELCT Val');
+		$result = $this->loadObject();
+
+		if (property_exists($result, 'Val'))
+		{
+			return $result->Val;
+		}
+		else
+		{
+			return false;
+		}
 	}
 
 	/**
@@ -181,13 +310,40 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 */
 	public function getConnectionCollation()
 	{
-		return $this->charset;
+		$this->connect();
+
+		// Attempt to get the database collation by accessing the server system variable.
+		$this->setQuery('SHOW VARIABLES LIKE "collation_connection"');
+		$result = $this->loadObject();
+
+		if (property_exists($result, 'Value'))
+		{
+			return $result->Value;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	/**
+	 * Get the number of returned rows for the previous executed SQL statement.
+	 * This command is only valid for statements like SELECT or SHOW that return an actual result set.
+	 * To retrieve the number of rows affected by an INSERT, UPDATE, REPLACE or DELETE query, use getAffectedRows().
+	 *
+	 * @param   resource  $cursor  An optional database cursor resource to extract the row count from.
+	 *
+	 * @return  integer   The number of returned rows.
+	 *
+	 * @since   12.1
+	 */
+	public function getNumRows($cursor = null)
+	{
+		return cubrid_num_rows($cursor ? $cursor : $this->cursor);
 	}
 
 	/**
 	 * Shows the table CREATE statement that creates the given tables.
-	 *
-	 * Note: Doesn't appear to have support in SQLite
 	 *
 	 * @param   mixed  $tables  A table name or a list of table names.
 	 *
@@ -200,10 +356,22 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	{
 		$this->connect();
 
+		$result = array();
+
 		// Sanitize input to an array and iterate over the list.
 		settype($tables, 'array');
 
-		return $tables;
+		foreach ($tables as $table)
+		{
+			// Set the query to get the table CREATE statement.
+			$this->setQuery('SHOW CREATE table ' . $this->quoteName($this->escape($table)));
+			$row = $this->loadRow();
+
+			// Populate the result array based on the create statements.
+			$result[$table] = $row[1];
+		}
+
+		return $result;
 	}
 
 	/**
@@ -214,53 +382,37 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 *
 	 * @return  array  An array of fields for the database table.
 	 *
-	 * @since   12.1
+	 * @since   12.2
 	 * @throws  RuntimeException
 	 */
 	public function getTableColumns($table, $typeOnly = true)
 	{
 		$this->connect();
 
-		$columns = array();
-		$query = $this->getQuery(true);
+		$result = array();
 
-		$fieldCasing = $this->getOption(PDO::ATTR_CASE);
-
-		$this->setOption(PDO::ATTR_CASE, PDO::CASE_UPPER);
-
-		$table = strtoupper($table);
-
-		$query->setQuery('pragma table_info(' . $table . ')');
-
-		$this->setQuery($query);
+		// Set the query to get the table fields statement.
+		$this->setQuery('SHOW FULL COLUMNS FROM ' . $this->quoteName($this->escape($table)));
 		$fields = $this->loadObjectList();
 
+		// If we only want the type as the value add just that to the list.
 		if ($typeOnly)
 		{
 			foreach ($fields as $field)
 			{
-				$columns[$field->NAME] = $field->TYPE;
+				$result[$field->Field] = preg_replace('/[(0-9)]/', '', $field->Type);
 			}
 		}
+		// If we want the whole field data object add that to the list.
 		else
 		{
 			foreach ($fields as $field)
 			{
-				// Do some dirty translation to MySQL output.
-				// TODO: Come up with and implement a standard across databases.
-				$columns[$field->NAME] = (object) array(
-					'Field' => $field->NAME,
-					'Type' => $field->TYPE,
-					'Null' => ($field->NOTNULL == '1' ? 'NO' : 'YES'),
-					'Default' => $field->DFLT_VALUE,
-					'Key' => ($field->PK != '0' ? 'PRI' : ''),
-				);
+				$result[$field->Field] = $field;
 			}
 		}
 
-		$this->setOption(PDO::ATTR_CASE, $fieldCasing);
-
-		return $columns;
+		return $result;
 	}
 
 	/**
@@ -270,64 +422,34 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 *
 	 * @return  array  An array of the column specification for the table.
 	 *
-	 * @since   12.1
+	 * @since   12.2
 	 * @throws  RuntimeException
 	 */
 	public function getTableKeys($table)
 	{
 		$this->connect();
 
-		$keys = array();
-		$query = $this->getQuery(true);
-
-		$fieldCasing = $this->getOption(PDO::ATTR_CASE);
-
-		$this->setOption(PDO::ATTR_CASE, PDO::CASE_UPPER);
-
-		$table = strtoupper($table);
-		$query->setQuery('pragma table_info( ' . $table . ')');
-
-		// $query->bind(':tableName', $table);
-
-		$this->setQuery($query);
-		$rows = $this->loadObjectList();
-
-		foreach ($rows as $column)
-		{
-			if ($column->PK == 1)
-			{
-				$keys[$column->NAME] = $column;
-			}
-		}
-
-		$this->setOption(PDO::ATTR_CASE, $fieldCasing);
+		// Get the details columns information.
+		$this->setQuery('SHOW KEYS FROM ' . $this->quoteName($table));
+		$keys = $this->loadObjectList();
 
 		return $keys;
 	}
 
 	/**
-	 * Method to get an array of all tables in the database (schema).
+	 * Method to get an array of all tables in the database.
 	 *
-	 * @return  array   An array of all the tables in the database.
+	 * @return  array  An array of all the tables in the database.
 	 *
-	 * @since   12.1
+	 * @since   12.2
 	 * @throws  RuntimeException
 	 */
 	public function getTableList()
 	{
 		$this->connect();
 
-		$type = 'table';
-
-		$query = $this->getQuery(true)
-			->select('name')
-			->from('sqlite_master')
-			->where('type = :type')
-			->bind(':type', $type)
-			->order('name');
-
-		$this->setQuery($query);
-
+		// Set the query to get the tables statement.
+		$this->setQuery('SHOW TABLES');
 		$tables = $this->loadColumn();
 
 		return $tables;
@@ -344,9 +466,170 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	{
 		$this->connect();
 
-		$this->setQuery('SELECT sqlite_version()');
+		return cubrid_get_server_info($this->connection);
+	}
 
-		return $this->loadResult();
+	/**
+	 * Method to get the auto-incremented value from the last INSERT statement.
+	 *
+	 * @return  mixed  The value of the auto-increment field from the last inserted row.
+	 *                 If the value is greater than maximal int value, it will return a string.
+	 *
+	 * @since   12.1
+	 */
+	public function insertid()
+	{
+		$this->connect();
+
+		return cubrid_insert_id($this->connection);
+	}
+
+	/**
+	 * Locks a table in the database.
+	 *
+	 * @param   string  $table  The name of the table to unlock.
+	 *
+	 * @return  JDatabaseDriverCubrid  Returns this object to support chaining.
+	 *
+	 * @since   12.2
+	 * @throws  RuntimeException
+	 */
+	public function lockTable($table)
+	{
+		return $this;
+	}
+
+	/**
+	 * Execute the SQL statement.
+	 *
+	 * @return  mixed  A database cursor resource on success, boolean false on failure.
+	 *
+	 * @since   12.1
+	 * @throws  RuntimeException
+	 */
+	public function execute()
+	{
+		$this->connect();
+
+		// Take a local copy so that we don't modify the original query and cause issues later
+		$query = $this->replacePrefix((string) $this->sql);
+
+		if (!($this->sql instanceof JDatabaseQuery) && ($this->limit > 0 || $this->offset > 0))
+		{
+			$query .= ' LIMIT ' . $this->offset . ', ' . $this->limit;
+		}
+		
+		// Increment the query counter.
+		$this->count++;
+
+		// Reset the error values.
+		$this->errorNum = 0;
+		$this->errorMsg = '';
+		$memoryBefore   = null;
+
+		// If debugging is enabled then let's log the query.
+		if ($this->debug)
+		{
+			// Add the query to the object queue.
+			$this->log[] = $query;
+
+			JLog::add($query, JLog::DEBUG, 'databasequery');
+
+			$this->timings[] = microtime(true);
+
+			if (is_object($this->cursor))
+			{
+				// Avoid warning if result already freed by third-party library
+				@$this->freeResult();
+			}
+
+			$memoryBefore = memory_get_usage();
+		}
+
+		// Execute the query. Error suppression is used here to prevent warnings/notices that the connection has been lost.
+		$this->cursor = @cubrid_execute($this->connection, $query);
+		
+		if ($this->debug)
+		{
+			$this->timings[] = microtime(true);
+
+			if (defined('DEBUG_BACKTRACE_IGNORE_ARGS'))
+			{
+				$this->callStacks[] = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+			}
+			else
+			{
+				$this->callStacks[] = debug_backtrace();
+			}
+
+			$this->callStacks[count($this->callStacks) - 1][0]['memory'] = array(
+				$memoryBefore,
+				memory_get_usage(),
+				is_object($this->cursor) ? $this->getNumRows() : null,
+			);
+		}
+
+		// If an error occurred handle it.
+		if (!$this->cursor)
+		{
+			// Get the error number and message before we execute any more queries.
+			$this->errorNum = $this->getErrorNumber();
+			$this->errorMsg = $this->getErrorMessage();
+
+			// Check if the server was disconnected.
+			if (!$this->connected())
+			{
+				try
+				{
+					// Attempt to reconnect.
+					$this->connection = null;
+					$this->connect();
+				}
+				// If connect fails, ignore that exception and throw the normal exception.
+				catch (RuntimeException $e)
+				{
+					// Get the error number and message.
+					$this->errorNum = $this->getErrorNumber();
+					$this->errorMsg = $this->getErrorMessage();
+
+					JLog::add(JText::sprintf('JLIB_DATABASE_QUERY_FAILED', $this->errorNum, $this->errorMsg), JLog::ERROR, 'database-error');
+
+					throw new JDatabaseExceptionExecuting($query, $this->errorMsg, $this->errorNum, $e);
+				}
+
+				// Since we were able to reconnect, run the query again.
+				return $this->execute();
+			}
+			// The server was not disconnected.
+			else
+			{
+				JLog::add(JText::sprintf('JLIB_DATABASE_QUERY_FAILED', $this->errorNum, $this->errorMsg), JLog::ERROR, 'database-error');
+
+				throw new JDatabaseExceptionExecuting($query, $this->errorMsg, $this->errorNum);
+			}
+		}
+		
+		return $this->cursor;
+	}
+
+	/**
+	 * Renames a table in the database.
+	 *
+	 * @param   string  $oldTable  The name of the table to be renamed
+	 * @param   string  $newTable  The new name for the table.
+	 * @param   string  $backup    Not used by MySQL.
+	 * @param   string  $prefix    Not used by MySQL.
+	 *
+	 * @return  JDatabaseDriverCubrid  Returns this object to support chaining.
+	 *
+	 * @since   12.2
+	 * @throws  RuntimeException
+	 */
+	public function renameTable($oldTable, $newTable, $backup = null, $prefix = null)
+	{
+		$this->setQuery('RENAME TABLE ' . $oldTable . ' TO ' . $newTable)->execute();
+
+		return $this;
 	}
 
 	/**
@@ -358,7 +641,7 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 *
 	 * @since   12.1
 	 * @throws  RuntimeException
-	 */
+	 */ 
 	public function select($database)
 	{
 		$this->connect();
@@ -369,80 +652,24 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	/**
 	 * Set the connection to use UTF-8 character encoding.
 	 *
-	 * Returns false automatically for the Oracle driver since
-	 * you can only set the character set when the connection
-	 * is created.
-	 *
 	 * @return  boolean  True on success.
 	 *
 	 * @since   12.1
 	 */
 	public function setUtf()
 	{
+		$result = true;
+	
+		// If UTF is not supported return false immediately
+		if (!$this->utf)
+		{
+			return false;
+		}
+
+		// Make sure we're connected to the server
 		$this->connect();
 
-		return false;
-	}
-
-	/**
-	 * Locks a table in the database.
-	 *
-	 * @param   string  $table  The name of the table to unlock.
-	 *
-	 * @return  JDatabaseDriverSqlite  Returns this object to support chaining.
-	 *
-	 * @since   12.1
-	 * @throws  RuntimeException
-	 */
-	public function lockTable($table)
-	{
-		return $this;
-	}
-
-	/**
-	 * Renames a table in the database.
-	 *
-	 * @param   string  $oldTable  The name of the table to be renamed
-	 * @param   string  $newTable  The new name for the table.
-	 * @param   string  $backup    Not used by Sqlite.
-	 * @param   string  $prefix    Not used by Sqlite.
-	 *
-	 * @return  JDatabaseDriverSqlite  Returns this object to support chaining.
-	 *
-	 * @since   12.1
-	 * @throws  RuntimeException
-	 */
-	public function renameTable($oldTable, $newTable, $backup = null, $prefix = null)
-	{
-		$this->setQuery('ALTER TABLE ' . $oldTable . ' RENAME TO ' . $newTable)->execute();
-
-		return $this;
-	}
-
-	/**
-	 * Unlocks tables in the database.
-	 *
-	 * @return  JDatabaseDriverSqlite  Returns this object to support chaining.
-	 *
-	 * @since   12.1
-	 * @throws  RuntimeException
-	 */
-	public function unlockTables()
-	{
-		return $this;
-	}
-
-	/**
-	 * Test to see if the PDO ODBC connector is available.
-	 *
-	 * @return  boolean  True on success, false otherwise.
-	 *
-	 * @since   12.1
-	 */
-	public static function isSupported()
-	{
-		return class_exists('PDO');
-		// && in_array('cubrid', PDO::getAvailableDrivers());
+		return $result;
 	}
 
 	/**
@@ -452,7 +679,7 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 *
 	 * @return  void
 	 *
-	 * @since   12.3
+	 * @since   12.2
 	 * @throws  RuntimeException
 	 */
 	public function transactionCommit($toSavepoint = false)
@@ -461,12 +688,15 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 
 		if (!$toSavepoint || $this->transactionDepth <= 1)
 		{
-			parent::transactionCommit($toSavepoint);
+			if ($this->setQuery('COMMIT')->execute())
+			{
+				$this->transactionDepth = 0;
+			}
+
+			return;
 		}
-		else
-		{
-			$this->transactionDepth--;
-		}
+
+		$this->transactionDepth--;
 	}
 
 	/**
@@ -476,7 +706,7 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 *
 	 * @return  void
 	 *
-	 * @since   12.3
+	 * @since   12.2
 	 * @throws  RuntimeException
 	 */
 	public function transactionRollback($toSavepoint = false)
@@ -485,17 +715,20 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 
 		if (!$toSavepoint || $this->transactionDepth <= 1)
 		{
-			parent::transactionRollback($toSavepoint);
-		}
-		else
-		{
-			$savepoint = 'SP_' . ($this->transactionDepth - 1);
-			$this->setQuery('ROLLBACK TO ' . $this->quoteName($savepoint));
-
-			if ($this->execute())
+			if ($this->setQuery('ROLLBACK')->execute())
 			{
-				$this->transactionDepth--;
+				$this->transactionDepth = 0;
 			}
+
+			return;
+		}
+
+		$savepoint = 'SP_' . ($this->transactionDepth - 1);
+		$this->setQuery('ROLLBACK TO SAVEPOINT ' . $this->quoteName($savepoint));
+
+		if ($this->execute())
+		{
+			$this->transactionDepth--;
 		}
 	}
 
@@ -506,7 +739,7 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	 *
 	 * @return  void
 	 *
-	 * @since   12.3
+	 * @since   12.2
 	 * @throws  RuntimeException
 	 */
 	public function transactionStart($asSavepoint = false)
@@ -515,7 +748,9 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 
 		if (!$asSavepoint || !$this->transactionDepth)
 		{
-			parent::transactionStart($asSavepoint);
+			$this->transactionDepth = 1;
+
+			return;
 		}
 
 		$savepoint = 'SP_' . $this->transactionDepth;
@@ -528,33 +763,232 @@ class JDatabaseDriverCubrid extends JDatabaseDriverPdo
 	}
 
 	/**
-	 * Get the query strings to alter the character set and collation of a table.
+	 * Method to fetch a row from the result set cursor as an array.
 	 *
-	 * @param   string  $tableName  The name of the table
+	 * @param   mixed  $cursor  The optional result set cursor from which to fetch the row.
 	 *
-	 * @return  string[]  The queries required to alter the table's character set and collation
+	 * @return  mixed  Either the next row from the result set or false if there are no more rows.
 	 *
-	 * @since   CMS 3.5.0
+	 * @since   12.1
 	 */
-	public function getAlterTableCharacterSet($tableName)
+	protected function fetchArray($cursor = null)
 	{
-		return array();
+		return cubrid_fetch_row($cursor ? $cursor : $this->cursor);
 	}
 
 	/**
-	 * Return the query string to create new Database.
-	 * Each database driver, other than MySQL, need to override this member to return correct string.
+	 * Method to fetch a row from the result set cursor as an associative array.
 	 *
-	 * @param   stdClass  $options  Object used to pass user and database name to database driver.
-	 *                   This object must have "db_name" and "db_user" set.
-	 * @param   boolean   $utf      True if the database supports the UTF-8 character set.
+	 * @param   mixed  $cursor  The optional result set cursor from which to fetch the row.
 	 *
-	 * @return  string  The query that creates database
+	 * @return  mixed  Either the next row from the result set or false if there are no more rows.
 	 *
-	 * @since   12.2
+	 * @since   12.1
 	 */
-	protected function getCreateDatabaseQuery($options, $utf)
+	protected function fetchAssoc($cursor = null)
 	{
-		return 'CREATE DATABASE ' . $this->quoteName($options->db_name);
+		return cubrid_fetch_assoc($cursor ? $cursor : $this->cursor);
+	}
+
+	/**
+	 * Method to fetch a row from the result set cursor as an object.
+	 *
+	 * @param   mixed   $cursor  The optional result set cursor from which to fetch the row.
+	 * @param   string  $class   The class name to use for the returned row object.
+	 *
+	 * @return  mixed   Either the next row from the result set or false if there are no more rows.
+	 *
+	 * @since   12.1
+	 */
+	protected function fetchObject($cursor = null, $class = 'stdClass')
+	{
+		return cubrid_fetch_object($cursor ? $cursor : $this->cursor, $class);
+	}
+
+	/**
+	 * Method to free up the memory used for the result set.
+	 *
+	 * @param   mixed  $cursor  The optional result set cursor from which to fetch the row.
+	 *
+	 * @return  void
+	 *
+	 * @since   12.1
+	 */
+	protected function freeResult($cursor = null)
+	{
+		cubrid_free_result($cursor ? $cursor : $this->cursor);
+
+		if ((! $cursor) || ($cursor === $this->cursor))
+		{
+			$this->cursor = null;
+		}
+	}
+
+	/**
+	 * Unlocks tables in the database.
+	 *
+	 * @return  JDatabaseDriverCubrid  Returns this object to support chaining.
+	 *
+	 * @since   12.1
+	 * @throws  RuntimeException
+	 */
+	public function unlockTables()
+	{
+		return $this;
+	}
+
+	/**
+	 * Internal function to check if profiling is available
+	 *
+	 * @return  boolean
+	 *
+	 * @since   3.1.3
+	 */
+	private function hasProfiling()
+	{
+		return false;
+	}
+
+	/**
+	 * Does the database server claim to have support for UTF-8 Multibyte (utf8mb4) collation?
+	 *
+	 * libmysql supports utf8mb4 since 5.5.3 (same version as the MySQL server). mysqlnd supports utf8mb4 since 5.0.9.
+	 *
+	 * @return  boolean
+	 *
+	 * @since   CMS 3.5.0
+	 */
+	private function serverClaimsUtf8mb4Support()
+	{
+		return false;
+	}
+
+	/**
+	 * Return the actual SQL Error number
+	 *
+	 * @return  integer  The SQL Error number
+	 *
+	 * @since   3.4.6
+	 */
+	protected function getErrorNumber()
+	{
+		return (int) cubrid_errno($this->connection);
+	}
+
+	/**
+	 * Return the actual SQL Error message
+	 *
+	 * @return  string  The SQL Error message
+	 *
+	 * @since   3.4.6
+	 */
+	protected function getErrorMessage()
+	{
+		$errorMessage = (string) cubrid_error($this->connection);
+
+		// Replace the Databaseprefix with `#__` if we are not in Debug
+		if (!$this->debug)
+		{
+			$errorMessage = str_replace($this->tablePrefix, '#__', $errorMessage);
+		}
+
+		return $errorMessage;
+	}
+	
+	/**
+	 * Get the query string to alter the database character set.
+	 *
+	 * @param   string  $dbName  The database name
+	 *
+	 * @return  string  The query that alter the database query string
+	 *
+	 * @since   12.1
+	 */
+	public function getAlterDbCharacterSet($dbName)
+	{		
+		// CUBRID does not support ALTER DATABASE query, so this is replaced to NULL query 
+		$query = 'SELECT NULL';
+
+		return $query;
+	}
+
+	/**
+	 * Inserts a row into a table based on an object's properties.
+	 *
+	 * @param   string  $table    The name of the database table to insert into.
+	 * @param   object  &$object  A reference to an object whose public properties match the table fields.
+	 * @param   string  $key      The name of the primary key. If provided the object property is updated.
+	 *
+	 * @return  boolean    True on success.
+	 *
+	 * @since   11.1
+	 * @throws  RuntimeException
+	 */
+	public function insertObject($table, &$object, $key = null)
+	{		
+		$columns = $this->getTableColumns($table, false);
+
+		$auto_col = null;
+		foreach ($columns as $column)
+		{
+			if ($column->Extra == 'auto_increment')
+			{
+				$auto_col = $column->Field;
+				break;
+			}
+		}
+			
+		$fields = array();
+		$values = array();
+
+		// Iterate over the object variables to build the query fields and values.
+		foreach (get_object_vars($object) as $k => $v)
+		{
+			// Only process non-null scalars.
+			if (is_array($v) or is_object($v) or $v === null)
+			{
+				continue;
+			}
+
+			// Ignore any internal fields.
+			if ($k[0] == '_')
+			{
+				continue;
+			}
+
+			// Exclude auto_increment column
+			if ($auto_col && $k == $auto_col)
+			{
+				continue;
+			}
+
+			// Prepare and sanitize the fields and values for the database query.
+			$fields[] = $this->quoteName($k);
+			$values[] = $this->quote($v);
+		}
+
+		// Create the base insert statement.
+		$query = $this->getQuery(true)
+			->insert($this->quoteName($table))
+			->columns($fields)
+			->values(implode(',', $values));
+
+		// Set the query and execute the insert.
+		$this->setQuery($query);
+
+		if (!$this->execute())
+		{
+			return false;
+		}
+
+		// Update the primary key if it exists.
+		$id = $this->insertid();
+
+		if ($key && $id && is_string($key))
+		{
+			$object->$key = $id;
+		}
+
+		return true;
 	}
 }
