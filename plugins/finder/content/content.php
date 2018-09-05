@@ -369,7 +369,7 @@ class PlgFinderContent extends FinderIndexerAdapter
 		$case_when_category_alias .= $c_id . ' END as catslug';
 		$query->select($case_when_category_alias)
 
-			->select('u.name AS author')
+			->select('u.name AS ' . $db->quoteName('author'))
 			->from('#__content AS a')
 			->join('LEFT', '#__categories AS c ON c.id = a.catid')
 			->join('LEFT', '#__users AS u ON u.id = a.created_by');
